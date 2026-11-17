@@ -74,6 +74,95 @@ CREATE TABLE IF NOT EXISTS totals (
 CREATE TABLE IF NOT EXISTS manifests (
     batch_id TEXT PRIMARY KEY, json TEXT NOT NULL
 );
+-- 跨站补估：邻站实测台账（只收实测；估值永不写进这张表）
+CREATE TABLE IF NOT EXISTS hydro_observations (
+    station_id TEXT NOT NULL,
+    obs_date TEXT NOT NULL,
+    rainfall_mm TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'measured' CHECK (kind = 'measured'),
+    revision INTEGER NOT NULL,
+    source TEXT NOT NULL DEFAULT 'manual',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (station_id, obs_date)
+);
+CREATE INDEX IF NOT EXISTS idx_hydro_obs_month
+    ON hydro_observations(station_id, obs_date);
+CREATE TABLE IF NOT EXISTS hydro_neighbors (
+    station_id TEXT NOT NULL,
+    neighbor_id TEXT NOT NULL,
+    coefficient TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (station_id, neighbor_id)
+);
+-- 已发应急补估：basis_json / result_json 是不可变快照，状态变化不改快照
+CREATE TABLE IF NOT EXISTS supplement_estimates (
+    estimate_id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    target_station TEXT NOT NULL,
+    month TEXT NOT NULL,
+    neighbors_json TEXT NOT NULL,
+    basis_digest TEXT NOT NULL,
+    basis_json TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    measured_mm TEXT NOT NULL,
+    estimated_mm TEXT NOT NULL,
+    total_mm TEXT NOT NULL,
+    gap_days INTEGER NOT NULL,
+    estimated_days INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    status_reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    revoked_at TEXT,
+    revoke_job_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_supplement_target
+    ON supplement_estimates(target_station, month, status);
+CREATE TABLE IF NOT EXISTS supplement_entries (
+    estimate_id TEXT NOT NULL,
+    obs_date TEXT NOT NULL,
+    estimated_mm TEXT NOT NULL,
+    neighbor_basis_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    superseded_by_revision INTEGER,
+    superseded_at TEXT,
+    PRIMARY KEY (estimate_id, obs_date)
+);
+CREATE TABLE IF NOT EXISTS supplement_dependencies (
+    estimate_id TEXT NOT NULL,
+    station_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    PRIMARY KEY (estimate_id, station_id, role)
+);
+CREATE INDEX IF NOT EXISTS idx_supplement_dep
+    ON supplement_dependencies(station_id, role);
+CREATE TABLE IF NOT EXISTS supplement_fillins (
+    idempotency_key TEXT PRIMARY KEY,
+    station_id TEXT NOT NULL,
+    obs_date TEXT NOT NULL,
+    rainfall_mm TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+-- 撤销作业：意图先落库，逐条处理；中断后 resume 从 pending 继续
+CREATE TABLE IF NOT EXISTS supplement_revocations (
+    job_id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL,
+    total INTEGER NOT NULL,
+    processed INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS supplement_revocation_items (
+    job_id TEXT NOT NULL,
+    estimate_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    code TEXT NOT NULL DEFAULT '',
+    processed_at TEXT,
+    PRIMARY KEY (job_id, estimate_id)
+);
 """
 
 
@@ -347,7 +436,365 @@ class Store:
             return {t: conn.execute(
                 f"SELECT COUNT(*) AS n FROM {t} WHERE batch_id=?", (batch_id,)
             ).fetchone()["n"] for t in tables}
+    # ---------- 跨站补估 ----------
+    # 读接口
+    def get_observation(self, station_id: str, obs_date: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM hydro_observations WHERE station_id=? AND obs_date=?",
+                (station_id, obs_date)).fetchone()
+        return dict(row) if row else None
+
+    def observations_between(self, station_id: str, start: str, end: str) -> list[dict]:
+        """[start, end] 闭区间内的实测；只读 kind='measured'，估值从不入这张表。"""
+        return self._all(
+            "SELECT * FROM hydro_observations WHERE station_id=? AND kind='measured' "
+            "AND obs_date>=? AND obs_date<=? ORDER BY obs_date",
+            (station_id, start, end))
+
+    def load_neighbors(self, station_id: str) -> list[dict]:
+        return self._all(
+            "SELECT * FROM hydro_neighbors WHERE station_id=? ORDER BY neighbor_id",
+            (station_id,))
+
+    def all_neighbors(self) -> list[dict]:
+        return self._all(
+            "SELECT * FROM hydro_neighbors ORDER BY station_id, neighbor_id", ())
+
+    def get_supplement(self, estimate_id: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM supplement_estimates WHERE estimate_id=?",
+                               (estimate_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_supplement_by_key(self, idempotency_key: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM supplement_estimates WHERE idempotency_key=?",
+                (idempotency_key,)).fetchone()
+        return dict(row) if row else None
+
+    def list_supplements(self, *, target_station: str | None = None,
+                         month: str | None = None,
+                         include_revoked: bool = True) -> list[dict]:
+        sql = "SELECT * FROM supplement_estimates WHERE 1=1"
+        args: list = []
+        if target_station:
+            sql += " AND target_station=?"
+            args.append(target_station)
+        if month:
+            sql += " AND month=?"
+            args.append(month)
+        if not include_revoked:
+            sql += " AND status NOT IN ('revoked')"
+        sql += " ORDER BY created_at, estimate_id"
+        return self._all(sql, tuple(args))
+
+    def load_supplement_entries(self, estimate_id: str) -> list[dict]:
+        rows = self._all(
+            "SELECT * FROM supplement_entries WHERE estimate_id=? ORDER BY obs_date",
+            (estimate_id,))
+        for row in rows:
+            row["neighbor_basis"] = json.loads(row.pop("neighbor_basis_json") or "{}")
+        return rows
+
+    def load_supplement_dependencies(self, estimate_id: str) -> list[dict]:
+        return self._all(
+            "SELECT station_id, role FROM supplement_dependencies WHERE estimate_id=? "
+            "ORDER BY role, station_id", (estimate_id,))
+
+    # ---------- 写接口（显式事务，整段要么全成要么全不成） ----------
+    @contextmanager
+    def write_txn(self):
+        """BEGIN IMMEDIATE：先拿写锁再读后写，避免并发补测/补估各读旧版本。"""
+        conn = sqlite3.connect(self.path, timeout=15.0, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=15000")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            yield conn
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def write_observation(self, *, station_id: str, obs_date: str, rainfall_mm: str,
+                          source: str, stamp: str,
+                          expected_revision: int | None = None) -> dict | None:
+        """实测写入，revision 单调 +1；expected_revision 不符返回 None（过期依据）。"""
+        with self.write_txn() as conn:
+            row = conn.execute(
+                "SELECT revision FROM hydro_observations WHERE station_id=? "
+                "AND obs_date=?", (station_id, obs_date)).fetchone()
+            current = row["revision"] if row else None
+            if expected_revision is not None and (current or 0) != expected_revision:
+                return None
+            revision = (current or 0) + 1
+            conn.execute(
+                """INSERT INTO hydro_observations
+                     (station_id,obs_date,rainfall_mm,kind,revision,source,updated_at)
+                   VALUES (?,?,?,'measured',?,?,?)
+                   ON CONFLICT(station_id,obs_date) DO UPDATE SET
+                     rainfall_mm=excluded.rainfall_mm, revision=excluded.revision,
+                     source=excluded.source, updated_at=excluded.updated_at""",
+                (station_id, obs_date, rainfall_mm, revision, source, stamp))
+            saved = conn.execute(
+                "SELECT * FROM hydro_observations WHERE station_id=? AND obs_date=?",
+                (station_id, obs_date)).fetchone()
+        return dict(saved)
+
+    def write_neighbor(self, *, station_id: str, neighbor_id: str, coefficient: str,
+                       stamp: str) -> dict:
+        with self.write_txn() as conn:
+            conn.execute(
+                """INSERT INTO hydro_neighbors
+                     (station_id,neighbor_id,coefficient,updated_at)
+                   VALUES (?,?,?,?)
+                   ON CONFLICT(station_id,neighbor_id) DO UPDATE SET
+                     coefficient=excluded.coefficient, updated_at=excluded.updated_at""",
+                (station_id, neighbor_id, coefficient, stamp))
+            row = conn.execute(
+                "SELECT * FROM hydro_neighbors WHERE station_id=? AND neighbor_id=?",
+                (station_id, neighbor_id)).fetchone()
+        return dict(row)
+
+    def save_supplement(self, *, estimate: dict, entries: list[dict],
+                        dependencies: list[dict], basis_check: str = "none") -> bool:
+        """补估落库。
+
+        basis_check='strict' 时，在同一写事务里重新核对依据快照：
+        - 目标站与邻站在该月的实测集合（日期、值、revision）必须与 basis 完全一致；
+        - 邻站系数必须与 basis 一致；
+        - 任一变化 → 返回 False（调用方抛过期依据），不写任何行。
+        """
+        with self.write_txn() as conn:
+            if conn.execute(
+                    "SELECT 1 FROM supplement_estimates WHERE idempotency_key=?",
+                    (estimate["idempotency_key"],)).fetchone() is not None:
+                return False
+            if basis_check == "strict" and not _basis_matches(conn, estimate["basis"]):
+                return False
+            conn.execute(
+                """INSERT INTO supplement_estimates
+                     (estimate_id,idempotency_key,target_station,month,neighbors_json,
+                      basis_digest,basis_json,result_json,measured_mm,estimated_mm,
+                      total_mm,gap_days,estimated_days,status,status_reason,
+                      created_at,updated_at,revoked_at,revoke_job_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)""",
+                (estimate["estimate_id"], estimate["idempotency_key"],
+                 estimate["target_station"], estimate["month"],
+                 json.dumps(estimate["neighbors"], ensure_ascii=False),
+                 estimate["basis_digest"],
+                 json.dumps(estimate["basis"], ensure_ascii=False),
+                 json.dumps(estimate["result"], ensure_ascii=False),
+                 str(estimate["measured_mm"]), str(estimate["estimated_mm"]),
+                 str(estimate["total_mm"]), int(estimate["gap_days"]),
+                 int(estimate["estimated_days"]), "active", "",
+                 estimate["created_at"], estimate["created_at"]))
+            for entry in entries:
+                conn.execute(
+                    """INSERT INTO supplement_entries
+                         (estimate_id,obs_date,estimated_mm,neighbor_basis_json,status,
+                          superseded_by_revision,superseded_at)
+                       VALUES (?,?,?,?,?,NULL,NULL)""",
+                    (estimate["estimate_id"], entry["date"], str(entry["estimated_mm"]),
+                     json.dumps(entry["neighbor_basis"], ensure_ascii=False), "active"))
+            for dep in dependencies:
+                conn.execute(
+                    """INSERT OR IGNORE INTO supplement_dependencies
+                         (estimate_id,station_id,role) VALUES (?,?,?)""",
+                    (estimate["estimate_id"], dep["station_id"], dep["role"]))
+        return True
+
+    def mark_supplement_stale(self, estimate_id: str, reason: str,
+                              stamp: str) -> bool:
+        with self.write_txn() as conn:
+            cur = conn.execute(
+                "UPDATE supplement_estimates SET status='stale', status_reason=?, "
+                "updated_at=? WHERE estimate_id=? AND status='active'",
+                (reason, stamp, estimate_id))
+            return cur.rowcount > 0
+
+    def mark_supplement_superseded(self, estimate_id: str, reason: str,
+                                   stamp: str, *, obs_date: str | None = None,
+                                   revision: int | None = None) -> bool:
+        """估值被实测取代：整体退出当前口径，但快照与逐日原值一字不改。"""
+        with self.write_txn() as conn:
+            cur = conn.execute(
+                "UPDATE supplement_estimates SET status='superseded', "
+                "status_reason=?, updated_at=? WHERE estimate_id=? "
+                "AND status IN ('active','stale')",
+                (reason, stamp, estimate_id))
+            if cur.rowcount > 0:
+                conn.execute(
+                    "UPDATE supplement_entries SET status='superseded', "
+                    "superseded_at=COALESCE(superseded_at, ?) "
+                    "WHERE estimate_id=? AND status='active'", (stamp, estimate_id))
+                if obs_date is not None:
+                    conn.execute(
+                        "UPDATE supplement_entries SET superseded_by_revision=? "
+                        "WHERE estimate_id=? AND obs_date=?", (revision, estimate_id,
+                                                              obs_date))
+            return cur.rowcount > 0
+
+    def basis_is_current(self, basis: dict) -> bool:
+        with self.connect() as conn:
+            return _basis_matches(conn, basis)
+
+    def record_fillin(self, *, idempotency_key: str, station_id: str, obs_date: str,
+                      rainfall_mm: str, revision: int, stamp: str) -> bool:
+        with self.write_txn() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO supplement_fillins "
+                "(idempotency_key,station_id,obs_date,rainfall_mm,revision,created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (idempotency_key, station_id, obs_date, rainfall_mm, revision, stamp))
+            return cur.rowcount > 0
+
+    def get_fillin(self, idempotency_key: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM supplement_fillins WHERE idempotency_key=?",
+                               (idempotency_key,)).fetchone()
+        return dict(row) if row else None
+
+    # ---------- 撤销作业 ----------
+    def create_revocation(self, *, job_id: str, idempotency_key: str, reason: str,
+                          estimate_ids: list[str], stamp: str) -> dict | None:
+        """建作业与逐条意图；同一幂等键第二次调用返回 None（调用方读旧作业）。"""
+        with self.write_txn() as conn:
+            row = conn.execute(
+                "SELECT job_id FROM supplement_revocations WHERE idempotency_key=?",
+                (idempotency_key,)).fetchone()
+            if row is not None:
+                return None
+            conn.execute(
+                """INSERT INTO supplement_revocations
+                     (job_id,idempotency_key,reason,status,total,processed,
+                      created_at,updated_at)
+                   VALUES (?,?,?,?,?,0,?,?)""",
+                (job_id, idempotency_key, reason, "pending", len(estimate_ids),
+                 stamp, stamp))
+            for estimate_id in estimate_ids:
+                conn.execute(
+                    """INSERT OR IGNORE INTO supplement_revocation_items
+                         (job_id,estimate_id,status,code,processed_at)
+                       VALUES (?,?,'pending','',NULL)""", (job_id, estimate_id))
+        return self.get_revocation(job_id)
+
+    def get_revocation(self, job_id: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM supplement_revocations WHERE job_id=?",
+                               (job_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_revocation_by_key(self, idempotency_key: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM supplement_revocations WHERE idempotency_key=?",
+                (idempotency_key,)).fetchone()
+        return dict(row) if row else None
+
+    def revocation_items(self, job_id: str) -> list[dict]:
+        return self._all(
+            "SELECT * FROM supplement_revocation_items WHERE job_id=? "
+            "ORDER BY estimate_id", (job_id,))
+
+    def pending_revocations(self) -> list[dict]:
+        return self._all(
+            "SELECT * FROM supplement_revocations WHERE status='pending' "
+            "ORDER BY created_at, job_id", ())
+
+    def revoke_one(self, *, job_id: str, estimate_id: str, reason: str,
+                   stamp: str) -> str:
+        """单条撤销，单独一个事务：中断时已完成条目仍生效，pending 可续跑。
+
+        快照（basis_json/result_json）与逐日估算值一律不动，只改状态。
+        """
+        with self.write_txn() as conn:
+            row = conn.execute(
+                "SELECT status FROM supplement_estimates WHERE estimate_id=?",
+                (estimate_id,)).fetchone()
+            if row is None:
+                code = "E_ESTIMATE_NOT_FOUND"
+            elif row["status"] == "revoked":
+                code = "K_ALREADY_REVOKED"
+            else:
+                conn.execute(
+                    "UPDATE supplement_estimates SET status='revoked', "
+                    "status_reason=?, revoked_at=?, revoke_job_id=?, updated_at=? "
+                    "WHERE estimate_id=?",
+                    (reason, stamp, job_id, stamp, estimate_id))
+                conn.execute(
+                    "UPDATE supplement_entries SET status='superseded', "
+                    "superseded_at=COALESCE(superseded_at, ?) "
+                    "WHERE estimate_id=? AND status='active'",
+                    (stamp, estimate_id))
+                code = "K_REVOKED"
+            item = conn.execute(
+                "SELECT status FROM supplement_revocation_items "
+                "WHERE job_id=? AND estimate_id=?", (job_id, estimate_id)).fetchone()
+            if item is not None:
+                conn.execute(
+                    "UPDATE supplement_revocation_items SET status='done', code=?, "
+                    "processed_at=? WHERE job_id=? AND estimate_id=?",
+                    (code, stamp, job_id, estimate_id))
+        return code
+
+    def finish_revocation(self, job_id: str, stamp: str) -> dict | None:
+        with self.write_txn() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) AS n FROM supplement_revocation_items "
+                "WHERE job_id=?", (job_id,)).fetchone()["n"]
+            done = conn.execute(
+                "SELECT COUNT(*) AS n FROM supplement_revocation_items "
+                "WHERE job_id=? AND status='done'", (job_id,)).fetchone()["n"]
+            status = "done" if done == total else "pending"
+            conn.execute(
+                "UPDATE supplement_revocations SET status=?, processed=?, updated_at=? "
+                "WHERE job_id=?", (status, done, stamp, job_id))
+        return self.get_revocation(job_id)
+
 
     def _all(self, sql: str, args: tuple) -> list[dict]:
         with self.connect() as conn:
             return [dict(r) for r in conn.execute(sql, args).fetchall()]
+
+def _basis_matches(conn, basis: dict) -> bool:
+    """依据快照 vs 当前实测台账。只在写事务或只读连接里调用。"""
+    for part in basis.get("observations", []):
+        station = part["station_id"]
+        rows = conn.execute(
+            "SELECT obs_date, rainfall_mm, revision FROM hydro_observations "
+            "WHERE station_id=? AND kind='measured' AND obs_date>=? AND obs_date<=? "
+            "ORDER BY obs_date",
+            (station, basis["window"]["start"], basis["window"]["end"])).fetchall()
+        current = [[r["obs_date"], r["rainfall_mm"], r["revision"]] for r in rows]
+        expected = [[r["date"], r["rainfall_mm"], r["revision"]]
+                    for r in part["rows"]]
+        if current != expected:
+            return False
+    # 目标站实测只增不减：补测到达后旧估值必须退出当前口径
+    target = basis["observations"][0]
+    target_now = _observation_count(conn, target["station_id"], basis["window"])
+    if target_now > len(target["rows"]):
+        return False
+    for item in basis.get("neighbors", []):
+        row = conn.execute(
+            "SELECT coefficient FROM hydro_neighbors WHERE station_id=? "
+            "AND neighbor_id=?",
+            (basis["target_station"], item["neighbor_id"])).fetchone()
+        if row is None or row["coefficient"] != item["coefficient"]:
+            return False
+    return True
+
+
+def _observation_count(conn, station: str, window: dict) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) AS n FROM hydro_observations WHERE station_id=? "
+        "AND kind='measured' AND obs_date>=? AND obs_date<=?",
+        (station, window["start"], window["end"])).fetchone()["n"]

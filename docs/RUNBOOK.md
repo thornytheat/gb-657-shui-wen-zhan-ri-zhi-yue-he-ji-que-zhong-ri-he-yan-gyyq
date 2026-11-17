@@ -31,6 +31,36 @@ curl -sS http://localhost:18216/api/reconcile | python3 -m json.tool
 curl -sS -o /tmp/monthly.csv http://localhost:18216/api/export/monthly.csv
 ```
 
+## 2.5 跨站补估
+
+```bash
+# 1. 配置邻站系数
+curl -sS -X POST http://localhost:18216/api/supplement/neighbors \
+  -H 'Content-Type: application/json' \
+  -d '{"station_id":"0012","neighbor_id":"0031","coefficient":"1.2"}'
+# 2. 登记邻站实测与目标站已有实测
+curl -sS -X POST http://localhost:18216/api/supplement/observations \
+  -H 'Content-Type: application/json' \
+  -d '{"station_id":"0031","date":"2024-02-02","rainfall_mm":"10.0"}'
+# 3. 预览依据摘要，再补估（同幂等键重试返回同一份结果）
+curl -sS -X POST http://localhost:18216/api/supplement/preview \
+  -H 'Content-Type: application/json' -d '{"station_id":"0012","month":"2024-02"}'
+curl -sS -X POST http://localhost:18216/api/supplement/estimates \
+  -H 'Content-Type: application/json' \
+  -d '{"station_id":"0012","month":"2024-02","idempotency_key":"2024-02-v1"}'
+# 4. 回读：实测 / 估算 / 含估分开
+curl -sS 'http://localhost:18216/api/supplement/readback?station_id=0012&month=2024-02'
+# 5. 依据更正后立即撤销；中断用 resume 续跑
+curl -sS -X POST http://localhost:18216/api/supplement/revocations \
+  -H 'Content-Type: application/json' \
+  -d '{"idempotency_key":"rv-2024-02","station_id":"0012","month":"2024-02"}'
+curl -sS -X POST http://localhost:18216/api/supplement/revocations/resume -d '{}'
+# 6. 撤销件随时可按落库快照复算（不读当前台账）
+curl -sS http://localhost:18216/api/supplement/estimates/se-xxxxxxxxxxxxxxxx
+```
+
+页面：<http://localhost:18216/supplement?station_id=0012&month=2024-02>。
+
 ## 3 常见操作
 
 - **同输入重跑**：再点一次「开始处理」或 POST 同一 `sample`，命中批次键，返回同一 `batch_id`，行数与合计不变。
@@ -51,6 +81,10 @@ curl -sS -o /tmp/monthly.csv http://localhost:18216/api/export/monthly.csv
 | 400 `E_SAMPLE_UNKNOWN` | 样例名不在白名单 | 用页面下拉框里的名字 |
 | 404 `E_BATCH_NOT_FOUND` | 还没有批次就导出 | 先跑一次处理 |
 | 四账「不平」 | 逻辑或数据被改 | 看差额字段与说明，逐账核对 |
+| 422 `E_SUPPLEMENT_NO_NEIGHBOR` | 目标站没有邻站配置 | 先 POST 邻站系数 |
+| 422 `E_SUPPLEMENT_CYCLE` | 邻站依赖成环 | 去掉回指的邻站关系 |
+| 409 `E_SUPPLEMENT_REVISION_STALE` | 补测带了过期 `expected_revision` | 重新读取当前 revision 再补测 |
+| 409 `E_SUPPLEMENT_BASIS_STALE` | 补估依据在计算/落库期间被改 | 重新预览取新 `basis_digest` 再补估；旧结果仍可回读 |
 
 日志：`docker compose logs -f app`（uvicorn 访问日志）。运行清单里的 `input_digest` 可用来确认两次运行读的是同一份输入。
 

@@ -73,12 +73,25 @@
 2. 分量闭合：同月「总表 −（峰+平+谷）」若不等于 0，差额并入当月用量最大的分量（并列取 峰 > 平 > 谷），并标 `K_TOU_ADJUSTED`。
 3. 账单闭合：账单额 = 先合计再四舍五入；分项金额各自向下截尾，差额按小数部分从大到小逐分补到分项，补完分项之和等于账单额，差额记 `adjust_cents`。
 
+## 8.5 跨站补估（M8）
+
+| 字段 | 含义 |
+|---|---|
+| `station_id` / `date` / `rainfall_mm` | 实测台账主键与值；`kind` 恒为 `measured`，`revision` 每次写入 +1 |
+| `hydro_neighbors.coefficient` | 目标站对邻站的折算系数，估值 = 同日邻站实测 × 系数 |
+| `basis_digest` | 依据快照摘要：目标站与邻站该月实测（日期/值/revision）+ 系数 |
+| `estimate_status` | `active` 当前生效 / `stale` 依据变化 / `superseded` 已被新补估或实测取代 / `revoked` 已撤销 |
+| `supplement_entries` | 逐日估值；`status`、`superseded_by_revision` 记录被实测取代的证据，估算值本身不改 |
+| 月量三行 | `measured` 实测日数/雨量/缺日，`estimated` 估算日数/雨量/无邻站实测日期，`with_estimate` 含估月量 |
+
 ## 9 原因码
 
 文件级 `E_*`：`E_EMPTY_FILE`、`E_HEADER_ONLY`、`E_ALL_BLANK`、`E_HEADER_INVALID`、`E_DECODE`、`E_SAMPLE_UNKNOWN`、`E_CONTRACT_INVALID`、`E_BATCH_NOT_FOUND`。
 
 行级 `Q_*`：`Q_COLUMN_COUNT`、`Q_TRUNCATED_ROW`、`Q_MISSING_READING`、`Q_BAD_READING`、`Q_BAD_TIME`、`Q_UNKNOWN_METER`、`Q_BAD_REGISTER`、`Q_BAD_UNIT`、`Q_BAD_READ_TYPE`、`Q_NEGATIVE_READING`、`Q_EXCEEDS_CAPACITY`、`Q_REVERSE_READING`、`Q_DUPLICATE_CONFLICT`、`Q_METER_RETIRED`。
 
-标记 `K_*`：`K_ROLLOVER`、`K_REPLACEMENT_FIRST`、`K_ESTIMATE_SKIPPED`、`K_CHARSET_FALLBACK`、`K_BOM_STRIPPED`、`K_SEGMENT_SPLIT`、`K_TRUNCATED_TAIL`、`K_TOU_ADJUSTED`、`K_BILL_ROUNDED`、`K_UNIT_ASSUMED`、`K_UNIT_CONVERTED`、`K_DUPLICATE_IDENTICAL`。
+补估 `E_SUPPLEMENT_*`：字段缺失、月份/日期/数值/系数无效、无邻站、依赖成环、补测版本过期、补估依据变化、撤销作业不存在。
+
+标记 `K_*`：`K_ROLLOVER`、`K_REPLACEMENT_FIRST`、`K_ESTIMATE_SKIPPED`、`K_CHARSET_FALLBACK`、`K_BOM_STRIPPED`、`K_SEGMENT_SPLIT`、`K_TRUNCATED_TAIL`、`K_TOU_ADJUSTED`、`K_BILL_ROUNDED`、`K_UNIT_ASSUMED`、`K_UNIT_CONVERTED`、`K_DUPLICATE_IDENTICAL`、`K_REVOKED`、`K_ALREADY_REVOKED`。
 
 唯一来源：`app/reasons.py`；页面与导出的原因文案都从它取。

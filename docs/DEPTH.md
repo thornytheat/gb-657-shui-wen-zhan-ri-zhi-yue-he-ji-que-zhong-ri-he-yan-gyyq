@@ -1,6 +1,6 @@
 # 深度登记 hydrocalendar（水文站日值月合计缺重日核验）
 
-- 规模：中型（7 个功能模块 / 6 个应用页 / 77 条测试）
+- 规模：中型（8 个功能模块 / 7 个应用页 / 107 条测试）
 - 核心规则：站点日值按版本选择而非后写覆盖，零雨与缺测分开；月合计用 Decimal，并以当地自然日日历核对完整度。
 - 使用者与工作流：流域数据员复核多站逐日雨量、缺重日、月合计与相邻站异常。
 
@@ -15,6 +15,7 @@
 | M5 月量计算 | 按版本选择日值并计算月合计与缺日 | POST /api/hydro/monthly、页面 /months | `app/modules/m5_months/hydro.py` `app/modules/m5_months/allocate.py` `app/modules/m5_months/weights.py` | `tests/test_m5_months.py` `tests/test_hydro_rules.py` |
 | M6 批次与对账 | 跑全流程、查批次历史、看四账、失败重试 | POST /api/runs、GET /api/batches、GET /api/reconcile、页面 /batches | `app/modules/m6_batches/service.py` `app/modules/m6_batches/compare.py` `app/modules/m6_batches/history.py` `app/modules/m6_batches/resume.py` | `tests/test_m6_batches.py` |
 | M7 导出 | 导出单一月报与运行证据 | GET /api/export/monthly.csv、页面 /report | `app/modules/m7_export/evidence.py` `app/modules/m7_export/csv_out.py` `app/modules/m7_export/manifest_out.py` | `tests/test_m7_export.py` |
+| M8 跨站补估 | 邻站实测补目标站缺口，撤销与回读 | POST /api/supplement/observations、/estimates、/revocations；GET /api/supplement/readback、GET /api/supplement/estimates/{id}（按快照复现）、页面 /supplement | `app/modules/m8_supplement/estimator.py` `app/modules/m8_supplement/service.py` `app/store.py`（supplement_* 表） | `tests/test_m8_supplement.py` |
 
 端到端：`tests/test_e2e.py`（脏样例 → 六页 200 → 四账 → 导出，含 4xx 失败输入与幂等重跑）。
 不变量：`tests/test_invariants.py`（区间账 = 月度账、幂等重跑行数不变、月桶划分、账单闭合、读数分区）。
@@ -37,6 +38,12 @@
 | TRAP-16 | 传输截断，末行只剩半截且没有换行符 | 半行被当有效读数，凭空多一段 | 末行无换行 + 列数不齐 → `Q_TRUNCATED_ROW`，文件级留 `K_TRUNCATED_TAIL` | `app/modules/m1_ingest/service.py` | `tests/test_m1_ingest.py::test_truncated_tail_row_isolated` |
 | TRAP-18 | 0 字节文件、只有表头、数据行全是空行 | 三种都返回「成功导入 0 行」，或直接除零 | 三个文件级原因码分开返回，不落半批数据 | `app/modules/m1_ingest/service.py` | `tests/test_m1_ingest.py::test_empty_states_return_distinct_codes` |
 | TRAP-23 | 区间止点与下一段起点都算一次 | 相邻区间重复计入一天，月度用量偏高 | 区间与月桶都声明左闭右开 `[起, 止)`，相邻段首尾相接 | `app/modules/m5_months/weights.py`、`app/modules/m4_intervals/restore.py` | `tests/test_m5_months.py::test_month_slices_are_half_open`、`tests/test_m4_intervals.py::test_intervals_are_half_open_and_contiguous` |
+| TRAP-25 | 目标站缺日，邻站当天有实测，直接用邻站原值当目标站雨量 | 两站量级不同，估值系统性偏高或偏低 | 估值 = 同日邻站实测 × 目标站对该邻站的系数，逐日留 `neighbor_basis`（原值、系数、乘积） | `app/modules/m8_supplement/estimator.py` | `tests/test_m8_supplement.py::test_supplement_binds_neighbor_measured_and_coefficient` |
+| TRAP-26 | 补估结果被当成邻站的「实测」继续参与下一站补估 | 估值链式传播，误差越滚越大且无痕 | 实测台账只收 `kind='measured'` 写入；估值永不回写，邻站口径只数真实测日 | `app/store.py`、`app/modules/m8_supplement/service.py` | `tests/test_m8_supplement.py::test_estimate_never_becomes_another_station_measured_basis` |
+| TRAP-27 | 补测写入与补估读取并发，补估用了旧实测 | 用已被更正的数据出「应急月量」，事后无法复现 | 实测 revision 乐观锁 + `expected_basis_digest` + 落库写事务内二次核对依据，过期一律 409 不落行 | `app/store.py`、`app/modules/m8_supplement/service.py` | `tests/test_m8_supplement.py::test_basis_change_inside_write_transaction_is_rejected`、`test_concurrent_observation_submissions_keep_one_winner` |
+| TRAP-28 | 撤销中途崩溃，部分估值的逐日证据被删或作业消失 | 有的撤销了有的没撤，且无法判断依据 | 先落作业意图与逐条 pending，逐条独立事务撤销，只改状态不删快照；resume 幂等续跑 | `app/store.py`、`app/modules/m8_supplement/service.py` | `tests/test_m8_supplement.py::test_interrupted_revocation_resumes_without_duplicate_effects`、`test_revocation_survives_process_restart` |
+| TRAP-29 | 重试补估把同一缺口再估一遍 | 含估月量翻倍 | 幂等键唯一约束；同键返回同一份结果 | `app/modules/m8_supplement/service.py` | `tests/test_m8_supplement.py::test_retry_with_same_key_does_not_double_estimate` |
+| TRAP-30 | 零雨被当作缺测，或邻站零雨日期被跳过 | 缺日虚增，或估值漏日导致月量偏低 | 0.0 是有效实测读；邻站零雨正常折算为 0.000 并生成条目 | `app/modules/m8_supplement/estimator.py` | `tests/test_m8_supplement.py::test_zero_rain_is_measured_not_gap` |
 | TRAP-24 | 各月/各分量各自四舍五入后合计不等 | 分完差 0.001~0.02，账永远差几分 | 最大余额法分月；分量残差并入最大分量；账单先合计再舍入，分项补差 | `app/modules/m5_months/weights.py`、`app/modules/m5_months/tou.py` | `tests/test_m5_months.py::test_largest_remainder_keeps_total_exact`、`tests/test_m5_months.py::test_tou_components_closed_to_total` |
 
 ## 对账规则
@@ -51,6 +58,17 @@
 - 反例（朴素实现会挂）：`tests/test_m4_intervals.py::test_naive_subtraction_would_drop_rollover`（直接相减得负数，翻转段被丢）、`tests/test_m5_months.py::test_bill_rounding_closed_not_naive`（逐项四舍五入多 1 分）、`tests/test_m1_ingest.py::test_naive_splitlines_would_break_records`（带千分位的单元格被切成两列）。
 - 不变量：`tests/test_invariants.py::test_conservation_intervals_equal_months`（守恒）、`tests/test_invariants.py::test_idempotent_run_keeps_rows`（幂等）、`tests/test_invariants.py::test_month_slices_partition_every_interval`（划分）、`tests/test_invariants.py::test_bill_components_sum_equals_amount`（账单闭合）、`tests/test_invariants.py::test_readings_partition_holds`（分区）。
 - 端到端：`tests/test_e2e.py::test_full_pipeline_over_http`。
+
+## 跨站补估规则（M8）
+
+- 依据只读 `hydro_observations` 的实测行；估值从不写回实测台账，所以不会成为其他站的实测依据。
+- 一份补估的依据快照 = 目标站/邻站在该月的实测（日期 + 值 + revision）+ 邻站系数；摘要进入 `basis_digest`，落库后不可改写。
+- 缺口 = 目标站在该月没有实测的日期；只有缺口里邻站也有实测的日期才产出估值，`10.0 × 1.2 = 12.000`/日。
+- 回读把 `measured`（实测日数/雨量/缺日清单）、`estimated`（估算日数/雨量/无邻站的日期）、`with_estimate`（含估月量）三行分开给，`estimate_is_measured_basis` 恒为 false。
+- 邻站实测或系数变化 → 依赖它的补估转 `stale`（快照保留）；目标站补测落在缺日内 → 该补估转 `superseded` 并记 `superseded_by_revision`（快照保留）。
+- 并发：实测写入用 revision 乐观锁（`expected_revision` 不符返回 409）；补估可带 `expected_basis_digest`，且落库事务内二次核对依据，过期依据 409 且不写任何行。
+- 幂等：补测/补估/撤销都带幂等键；同键重试返回同一结果，不重复估雨。撤销先落作业意图与逐条 pending，可中断，`/revocations/resume` 或下次回读自动收尾；重复撤销幂等。
+- 零雨（0.0）是有效实测：既不跳过该日，也不当缺测；邻站零雨折算后估值为 0.000。无邻站、邻站成环（含自引用）直接拒绝。
 
 ## 已知不覆盖
 

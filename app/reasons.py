@@ -42,6 +42,21 @@ REASONS: dict[str, dict[str, str]] = {
     "K_UNIT_ASSUMED": {"label": "单位按契约补齐", "level": "info"},
     "K_UNIT_CONVERTED": {"label": "单位已折算", "level": "info"},
     "K_DUPLICATE_IDENTICAL": {"label": "重复行已合并", "level": "info"},
+    # 跨站补估
+    "E_SUPPLEMENT_FIELD_REQUIRED": {"label": "补估缺必填字段", "level": "error"},
+    "E_SUPPLEMENT_MONTH_INVALID": {"label": "补估月份格式无效", "level": "error"},
+    "E_SUPPLEMENT_DATE_INVALID": {"label": "补测日期格式无效", "level": "error"},
+    "E_SUPPLEMENT_VALUE_INVALID": {"label": "补测雨量无效", "level": "error"},
+    "E_SUPPLEMENT_COEFFICIENT_INVALID": {"label": "邻站系数无效", "level": "error"},
+    "E_SUPPLEMENT_STATION_REQUIRED": {"label": "补估缺目标站", "level": "error"},
+    "E_SUPPLEMENT_NO_NEIGHBOR": {"label": "无邻站可补估", "level": "error"},
+    "E_SUPPLEMENT_CYCLE": {"label": "邻站依赖成环", "level": "error"},
+    "E_SUPPLEMENT_REVISION_STALE": {"label": "补测依据版本过期", "level": "error"},
+    "E_SUPPLEMENT_BASIS_STALE": {"label": "补估依据已变化", "level": "error"},
+    "E_SUPPLEMENT_JOB_NOT_FOUND": {"label": "撤销作业不存在", "level": "error"},
+    "E_ESTIMATE_NOT_FOUND": {"label": "补估记录不存在", "level": "error"},
+    "K_REVOKED": {"label": "补估已撤销", "level": "info"},
+    "K_ALREADY_REVOKED": {"label": "补估此前已撤销", "level": "info"},
 }
 
 
